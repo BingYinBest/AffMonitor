@@ -1,0 +1,6 @@
+id=MoniGuard
+name=MoniGuard
+version=49
+versionCode=49
+author=Xiao
+description=一个获取应用CPU亲和情况的模块，开机不会自动运行，需要手动执行action切换运行和终止状态。
