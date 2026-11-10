@@ -10,70 +10,36 @@ mod rules;
 mod signals;
 
 use std::fs;
-use std::time::Duration;
 use std::fmt::Write;
+use std::rc::Rc;
+use std::time::Duration;
 use crate::constants::*;
 use crate::types::*;
 use crate::utils::{affinity_to_string, compare_threads};
 
 fn init_system_context() -> Option<SystemContext> {
-    let pid_cache_size = MAX_PACKAGES;
-    let last_foreground_capacity = MAX_PACKAGES;
-    let historical_rules_capacity = MAX_HISTORICAL_RULES;
-
-    let mut pid_cache = Vec::with_capacity(pid_cache_size);
-    for _ in 0..pid_cache_size {
-        pid_cache.push(PidCache {
-            pkg: String::new(),
-            pid: 0,
-            last_update: 0,
-        });
-    }
-
-    // 按需增长：外层按包索引，内层按实际线程数；不再预分配 128*1024 个槽位
-    let last_thread_data: Vec<Vec<ThreadData>> = Vec::new();
-
-    let mut last_foreground = Vec::with_capacity(last_foreground_capacity);
-    for _ in 0..last_foreground_capacity {
-        last_foreground.push(PackageThreads {
-            threads: Vec::new(),
-            num_threads: 0,
-        });
-    }
-
-    // 历史规则按需 push，不再预分配 2048 个空 RuleInfo
-    let historical_rules: Vec<RuleInfo> = Vec::new();
-
     let mut ctx = SystemContext {
         cpu_info: Vec::new(),
         clusters: Vec::new(),
         num_cpus: 0,
         num_clusters: 0,
-        little_cluster_end: -1,
-        big_cluster_start: -1,
-        super_core: -1,
-        last_thread_data,
-        pid_cache,
-        historical_rules,
-        historical_rules_capacity,
-        last_foreground,
+        cpu_ids: Vec::new(),
+        has_m: false,
+        has_p: false,
+        pid_cache: std::collections::HashMap::new(),
+        historical_rules: Vec::new(),
+        historical_rules_capacity: MAX_HISTORICAL_RULES,
+        thread_states: std::collections::HashMap::new(),
+        last_foreground: std::collections::HashMap::new(),
         affinity_initialized: false,
         cached_top_pkg: String::new(),
         last_top_pkg_time: 0,
         permissions_adjusted: false,
-        original_selinux_state: -1,
+        original_selinux_state: 0,
+        round: 0,
     };
 
-    cpuinfo::init_cpu_info(
-        &mut ctx.cpu_info,
-        &mut ctx.clusters,
-        &mut ctx.num_cpus,
-        &mut ctx.num_clusters,
-        &mut ctx.little_cluster_end,
-        &mut ctx.big_cluster_start,
-        &mut ctx.super_core,
-    );
-
+    cpuinfo::init_cpu_info(&mut ctx);
     signals::setup_signal_handlers();
 
     Some(ctx)
@@ -99,7 +65,7 @@ fn save_thread_file(ctx: &SystemContext, config_dir: &str, pkg: &str, pkg_thread
     let _ = writeln!(content, "应用状态: {}", if is_system { "系统进程（持续统计）" } else { if is_foreground { "前台" } else { "后台（显示最后前台数据）" } });
     let _ = writeln!(content, "CPU占用率(%)\tCPU亲和性\t线程名");
     for t in &pkg_threads.threads {
-        let aff = affinity_to_string(&t.affinity, ctx.num_cpus);
+        let aff = affinity_to_string(&t.affinity, &ctx.cpu_ids);
         let _ = writeln!(content, "{:.2}\t{}\t{}", t.cpu_usage_percent, aff, t.name);
     }
     fs::write(file_path, content).ok();
@@ -110,12 +76,15 @@ fn print_package_info(ctx: &SystemContext, pkg: &str, pid: i32, pkg_threads: &Pa
     println!("应用状态: {}", if is_system { "系统进程（持续统计）" } else { if is_foreground { "前台" } else { "后台（显示最后前台数据）" } });
     println!("CPU占用率(%)\tCPU亲和性\t线程名");
     for t in &pkg_threads.threads {
-        let aff = affinity_to_string(&t.affinity, ctx.num_cpus);
+        let aff = affinity_to_string(&t.affinity, &ctx.cpu_ids);
         println!("{:.2}\t{}\t{}", t.cpu_usage_percent, aff, t.name);
     }
 }
 
 fn main() {
+    // 崩溃恢复：若上次进程被 SIGKILL 而 SELinux 残留 Permissive，这里还原。
+    procscan::recover_selinux_on_startup();
+
     let mut ctx = match init_system_context() {
         Some(c) => c,
         None => {
@@ -144,12 +113,14 @@ fn main() {
     }
 
     loop {
-        if signals::KEEP_RUNNING.load(std::sync::atomic::Ordering::SeqCst) == false {
+        if !signals::KEEP_RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
             break;
         }
 
+        ctx.round = ctx.round.wrapping_add(1);
+
         if use_config {
-            // 仅在配置文件 mtime 变化或首次加载时重新解析 /proc，避免每 5 秒全量扫描
+            // 仅在配置文件 mtime 变化或首次加载时重新解析 /proc，避免每 5 秒全量扫描。
             let cfg_path = config_file.as_ref().unwrap();
             let mtime = fs::metadata(cfg_path)
                 .ok()
@@ -166,7 +137,7 @@ fn main() {
         }
 
         let sleep_time = Duration::from_secs(UPDATE_INTERVAL);
-        let idle_sleep_time = Duration::from_secs(15);
+        let idle_sleep_time = Duration::from_secs(IDLE_INTERVAL);
 
         if !use_config {
             let mut top_pkg = String::with_capacity(MAX_PKG_LEN);
@@ -176,16 +147,16 @@ fn main() {
                     pkgs.push((pkg, false));
                 }
                 _ => {
-                    // 没有前台 app，拉长唤醒间隔省电
-                    std::thread::sleep(idle_sleep_time);
+                    // 没有前台 app，拉长唤醒间隔省电。
+                    signals::sleep_fragmented(idle_sleep_time);
                     continue;
                 }
             }
         }
 
         let mut did_scan = false;
-        for (pkg_idx, (p, is_sys)) in pkgs.iter().enumerate() {
-            let pkg = p.as_str();
+        for (pkg, is_sys) in pkgs.iter() {
+            let pkg = pkg.as_str();
             let pid = match procscan::get_pid_by_package(&mut ctx, pkg) {
                 Some(p) if p > 0 => p,
                 _ => continue,
@@ -199,47 +170,43 @@ fn main() {
 
             let is_system = *is_sys;
 
-            let pkg_threads = if is_system || is_foreground {
+            // 获取本包线程数据。前台/系统直接扫描；后台复用缓存（Rc 引用计数，零拷贝）。
+            let data: Rc<PackageThreads> = if is_system || is_foreground {
                 did_scan = true;
-                match threads::get_threads_by_pid(&mut ctx, pid, pkg_idx) {
-                    Some(t) => {
-                        // 保存本次前台/系统扫描结果，供下次该应用切到后台时复现
-                        if pkg_idx < ctx.last_foreground.len() {
-                            ctx.last_foreground[pkg_idx] = t.clone();
-                        }
-                        t
+                match threads::get_threads_by_pid(&mut ctx, pkg, pid) {
+                    Some(mut t) => {
+                        t.threads.sort_by(|a, b| compare_threads(a, b));
+                        let rc = Rc::new(t);
+                        // 存入缓存，供该包下次切到后台时复现（BUG-1 修复：按包名索引）。
+                        ctx.last_foreground.insert(pkg.to_string(), rc.clone());
+                        rc
                     }
                     None => continue,
                 }
             } else {
-                if ctx.last_foreground.len() > pkg_idx && ctx.last_foreground[pkg_idx].num_threads > 0 {
-                    ctx.last_foreground[pkg_idx].clone()
-                } else {
-                    continue;
+                match ctx.last_foreground.get(pkg).cloned() {
+                    Some(rc) if rc.num_threads > 0 => rc,
+                    _ => continue,
                 }
             };
 
-            // 直接排序，避免 clone 整个线程数组
-            let mut sorted_pkg_threads = pkg_threads;
-            sorted_pkg_threads.threads.sort_by(|a, b| compare_threads(a, b));
-
-            // 规则生成只跑一次，结果同时用于 stdout 打印和写文件
+            // 规则生成只跑一次，结果同时用于 stdout 打印和写文件。
             let mut rules_out = String::new();
             let _ = writeln!(rules_out, "\n分配规则建议:\n#{}", pkg);
-            rules::generate_rules(&mut ctx, pkg, &sorted_pkg_threads, &mut rules_out, is_foreground, is_system);
+            rules::generate_rules(&mut ctx, pkg, &data, &mut rules_out, is_foreground, is_system);
             print!("{}", rules_out);
-            print_package_info(&ctx, pkg, pid, &sorted_pkg_threads, is_foreground, is_system);
+            print_package_info(&ctx, pkg, pid, &data, is_foreground, is_system);
 
             if use_config {
-                save_thread_file(&ctx, &config_dir, pkg, &sorted_pkg_threads, is_foreground, is_system, &rules_out);
+                save_thread_file(&ctx, &config_dir, pkg, &data, is_foreground, is_system, &rules_out);
             }
         }
 
         if did_scan {
-            std::thread::sleep(sleep_time);
+            signals::sleep_fragmented(sleep_time);
         } else {
-            // 全部包都在后台（用缓存数据），拉长唤醒间隔省电
-            std::thread::sleep(idle_sleep_time);
+            // 全部包都在后台（用缓存数据），拉长唤醒间隔省电。
+            signals::sleep_fragmented(idle_sleep_time);
         }
     }
 

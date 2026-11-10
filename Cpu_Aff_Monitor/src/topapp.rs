@@ -1,15 +1,16 @@
 use crate::cmd::exec_cmd;
-use crate::constants::{CMD_BUFFER_SIZE, MAX_PKG_LEN};
+use crate::constants::{CMD_BUFFER_SIZE, MAX_PKG_LEN, TOP_PKG_CACHE_SECS};
 use crate::types::SystemContext;
 use crate::utils::now_secs;
 
+/// 返回当前前台应用包名（3s 缓存）。命令 3 输出巨大，用 head 限流避免 16KB 截断漏检（BUG-5 修复）。
 pub fn get_top_app_name(ctx: &mut SystemContext, buf: &mut String) -> Option<String> {
     if buf.capacity() < MAX_PKG_LEN {
         eprintln!("错误: 无效缓冲区或大小");
         return None;
     }
     let current_time = now_secs();
-    if current_time - ctx.last_top_pkg_time < 3 && !ctx.cached_top_pkg.is_empty() {
+    if current_time - ctx.last_top_pkg_time < TOP_PKG_CACHE_SECS && !ctx.cached_top_pkg.is_empty() {
         *buf = ctx.cached_top_pkg.clone();
         return Some(buf.clone());
     }
@@ -18,7 +19,7 @@ pub fn get_top_app_name(ctx: &mut SystemContext, buf: &mut String) -> Option<Str
     let commands = [
         "/system/bin/dumpsys window | grep mCurrentFocus",
         "/system/bin/dumpsys window displays | grep -i mFocusedApp",
-        "/system/bin/dumpsys activity activities",
+        "/system/bin/dumpsys activity activities | head -c 30000",
         "/system/bin/dumpsys activity | grep -i mResumedActivity",
     ];
     let keywords = [

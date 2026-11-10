@@ -21,19 +21,24 @@ pub fn get_nprocs() -> usize {
     }
 }
 
-pub fn affinity_to_string(set: &cpu_set_t, num_cpus: usize) -> String {
+/// 把 cpu_set_t 转成 "0-3,6" 形式。按实际存在的 cpu_ids 遍历，
+/// 兼容非连续 / 离线 CPU（BUG-7 修复）。
+pub fn affinity_to_string(set: &cpu_set_t, cpu_ids: &[i32]) -> String {
     let mut ranges: Vec<String> = Vec::new();
     let mut start: i32 = -1;
     let mut last: i32 = -1;
-    for i in 0..num_cpus {
-        if unsafe { CPU_ISSET(i, set) } {
+    for &id in cpu_ids {
+        if id < 0 {
+            continue;
+        }
+        if unsafe { CPU_ISSET(id as usize, set) } {
             if start == -1 {
-                start = i as i32;
+                start = id;
             }
-            last = i as i32;
+            last = id;
         } else if start != -1 {
             if start == last {
-                ranges.push(format!("{}", start));
+                ranges.push(start.to_string());
             } else {
                 ranges.push(format!("{}-{}", start, last));
             }
@@ -42,7 +47,7 @@ pub fn affinity_to_string(set: &cpu_set_t, num_cpus: usize) -> String {
     }
     if start != -1 {
         if start == last {
-            ranges.push(format!("{}", start));
+            ranges.push(start.to_string());
         } else {
             ranges.push(format!("{}-{}", start, last));
         }
@@ -54,17 +59,61 @@ pub fn affinity_to_string(set: &cpu_set_t, num_cpus: usize) -> String {
     }
 }
 
-pub fn escape_thread_name(name: &str) -> String {
-    let special_chars = "*?[]{}";
-    let mut out = String::with_capacity(name.len());
-    for c in name.chars() {
-        if special_chars.contains(c) {
-            out.push('?');
-        } else {
-            out.push(c);
-        }
+/// 线程名转为可安全用于 AppOptR 线程模式的字面量。
+/// AppOptR 线程模式是 fnmatch 模式（FNM_NOESCAPE，无转义）；`{}`/`=` 会破坏其行解析，
+/// `*?[]` 会被当作通配导致过度匹配。含这些字符的名字无法精确表达，返回 None 跳过，
+/// 避免生成错误规则（BUG-2 关联）。
+pub fn appoptr_pattern(name: &str) -> Option<&str> {
+    if name.is_empty() {
+        return None;
     }
-    out
+    if name.contains('{') || name.contains('}') || name.contains('=') {
+        return None;
+    }
+    if name.contains('*') || name.contains('?') || name.contains('[') || name.contains(']') {
+        return None;
+    }
+    Some(name)
+}
+
+/// 生成线程规则的目标亲和（可含逗号组合）。2 档仅 e/hp，3 档 e/p/hp，4+ 档 e/m/p/hp。
+pub fn rule_semantic(rank: u8, has_m: bool, has_p: bool) -> &'static str {
+    match rank {
+        3 => "hp-core",
+        2 => {
+            if has_p {
+                "p-core,hp-core"
+            } else {
+                "hp-core"
+            }
+        }
+        1 => {
+            if has_m {
+                "m-core"
+            } else if has_p {
+                "p-core"
+            } else {
+                "e-core"
+            }
+        }
+        _ => "e-core",
+    }
+}
+
+/// 计算包级默认亲和（覆盖未命中线程规则的其余线程）。
+/// 系统进程偏大核，普通应用偏小核+中核；2 档时退化为 e,hp（即全部），1 档 all-core。
+pub fn default_tier(is_system: bool, has_p: bool) -> &'static str {
+    if is_system {
+        if has_p {
+            "p-core,hp-core"
+        } else {
+            "hp-core"
+        }
+    } else if has_p {
+        "e-core,p-core"
+    } else {
+        "e-core,hp-core"
+    }
 }
 
 pub fn compare_threads(a: &ThreadInfo, b: &ThreadInfo) -> Ordering {

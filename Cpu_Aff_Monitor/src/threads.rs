@@ -1,18 +1,21 @@
 use std::fs::{self, File};
 use std::io::Read;
 use libc::{cpu_set_t, CPU_ZERO, sched_getaffinity};
-use crate::constants::MAX_THREAD_LEN;
-use crate::types::{PackageThreads, SystemContext, ThreadData, ThreadInfo};
+use crate::constants::*;
+use crate::types::{PackageThreads, SystemContext, ThreadInfo, ThreadState};
 use crate::utils::mono_time;
+use std::cmp::Ordering;
 
+/// 扫描 /proc/<pid>/task，返回线程 tid 列表。
 pub fn scan_thread_ids(pid: i32) -> Option<Vec<i32>> {
     let task_path = format!("/proc/{}/task", pid);
     let entries = fs::read_dir(&task_path).ok()?;
     let mut tids = Vec::new();
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(tid) = name.parse::<i32>() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(tid) = name_str.parse::<i32>() {
                 tids.push(tid);
             }
         }
@@ -20,207 +23,188 @@ pub fn scan_thread_ids(pid: i32) -> Option<Vec<i32>> {
     Some(tids)
 }
 
+/// 读一个 u64 文本文件（栈缓冲，零堆分配）。读取失败返回 None。
 fn read_u64(path: &str) -> Option<u64> {
     let mut f = File::open(path).ok()?;
-    let mut buf = [0u8; 63];
+    let mut buf = [0u8; 32];
     let n = f.read(&mut buf).ok()?;
     let s = std::str::from_utf8(&buf[..n]).ok()?;
     s.trim().parse::<u64>().ok()
 }
 
-pub fn read_thread_info(
-    ctx: &mut SystemContext,
+/// 读 comm（栈缓冲，按 COMM_LEN 定长），返回字节数。
+fn read_comm(path: &str, buf: &mut [u8; COMM_LEN + 2]) -> usize {
+    if let Ok(mut f) = File::open(path) {
+        if let Ok(n) = f.read(buf) {
+            return n;
+        }
+    }
+    0
+}
+
+/// 从 stat 的 utime+stime 回退解析 CPU 时间（仅当内核无 schedstat 时）。
+fn read_stat_cpu_time(pid: i32, tid: i32) -> Option<u64> {
+    let path = format!("/proc/{}/task/{}/stat", pid, tid);
+    let mut f = File::open(&path).ok()?;
+    let mut buf = [0u8; 256];
+    let n = f.read(&mut buf).ok()?;
+    let s = String::from_utf8_lossy(&buf[..n]);
+    let rparen = s.rfind(')')?;
+    let after = &s[rparen + 1..];
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    if fields.len() > 12 {
+        if let (Ok(ut), Ok(st)) = (fields[11].parse::<u64>(), fields[12].parse::<u64>()) {
+            let clk = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+            if clk > 0 {
+                return Some((ut + st) * 1_000_000_000u64 / (clk as u64));
+            }
+        }
+    }
+    None
+}
+
+/// 读取一个线程的快照并更新其跨采样状态（EWMA / 名字缓存）。
+/// `states` 是本包线程状态表（按 tid 索引）。
+fn read_thread_info(
     pid: i32,
     tid: i32,
-    pkg_idx: usize,
+    states: &mut std::collections::HashMap<i32, ThreadState>,
     curr_time: libc::timespec,
+    round: u64,
 ) -> Option<ThreadInfo> {
-    let stat_path = format!("/proc/{}/task/{}/stat", pid, tid);
     let sched_path = format!("/proc/{}/task/{}/schedstat", pid, tid);
     let comm_path = format!("/proc/{}/task/{}/comm", pid, tid);
 
-    let mut cpu_time = read_u64(&sched_path).unwrap_or(0);
+    // schedstat 优先；读取失败（内核无 schedstat）才回退 stat。
+    let cpu_time = match read_u64(&sched_path) {
+        Some(v) => v,
+        None => read_stat_cpu_time(pid, tid)?,
+    };
 
-    if cpu_time == 0 {
-        if let Ok(mut f) = File::open(&stat_path) {
-            let mut buf = [0u8; 256];
-            if let Ok(n) = f.read(&mut buf) {
-                let s = String::from_utf8_lossy(&buf[..n]);
-                if let Some(rparen) = s.rfind(')') {
-                    let after = &s[rparen + 1..];
-                    let fields: Vec<&str> = after.split_whitespace().collect();
-                    if fields.len() > 12 {
-                        if let (Ok(ut), Ok(st)) = (fields[11].parse::<u64>(), fields[12].parse::<u64>()) {
-                            let clk = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-                            if clk > 0 {
-                                cpu_time = (ut + st) * 1_000_000_000u64 / (clk as u64);
-                            }
-                        }
-                    }
-                }
-            }
+    let state = states
+        .entry(tid)
+        .or_insert_with(|| ThreadState::new(pid));
+
+    // 计算瞬时占用率并更新双 EWMA。
+    let mut fast = 0.0;
+    let mut slow = 0.0;
+    if state.initialized && state.pid == pid {
+        let delta_sec = (curr_time.tv_sec - state.last_time.tv_sec) as i64;
+        let delta_nsec = (curr_time.tv_nsec - state.last_time.tv_nsec) as i64;
+        let delta_ns = delta_sec * 1_000_000_000i64 + delta_nsec;
+        let delta_time = if delta_ns > 0 { delta_ns as u64 } else { 0 };
+        let delta_cpu = if cpu_time >= state.last_cpu_time {
+            cpu_time - state.last_cpu_time
         } else {
-            return None;
+            0
+        };
+        let inst = if delta_time > 0 {
+            ((delta_cpu as f64 / delta_time as f64) * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        if !state.seeded {
+            state.fast = inst;
+            state.slow = inst;
+            state.seeded = true;
+        } else {
+            state.fast = (EWMA_FAST_W * inst + (1.0 - EWMA_FAST_W) * state.fast).min(100.0);
+            state.slow = (EWMA_SLOW_W * inst + (1.0 - EWMA_SLOW_W) * state.slow).min(100.0);
         }
+        fast = state.fast;
+        slow = state.slow;
+    } else {
+        // 新线程（或 tid 被新进程复用）：重建基线，本轮占用率记 0。
+        state.pid = pid;
+        state.initialized = true;
+        state.seeded = false;
+        state.fast = 0.0;
+        state.slow = 0.0;
     }
+    state.last_cpu_time = cpu_time;
+    state.last_time = curr_time;
+    state.seen = true;
 
-    let mut thread = ThreadInfo::new();
-    thread.cpu_time = cpu_time;
-    thread.tid = tid;
-
-    if ctx.affinity_initialized && pkg_idx < ctx.last_thread_data.len() {
-        for data in ctx.last_thread_data[pkg_idx].iter() {
-            if data.pid == pid && data.tid == tid {
-                // 先按 i64 计算（处理 tv_nsec 借位），再转 u64，避免直接 as u64 下溢
-                let delta_sec = (curr_time.tv_sec - data.last_time.tv_sec) as i64;
-                let delta_nsec = (curr_time.tv_nsec - data.last_time.tv_nsec) as i64;
-                let delta_time_ns_i = delta_sec * 1_000_000_000i64 + delta_nsec;
-                let delta_time_ns = if delta_time_ns_i > 0 { delta_time_ns_i as u64 } else { 0 };
-                let delta_cpu_time = if cpu_time >= data.last_cpu_time {
-                    cpu_time - data.last_cpu_time
-                } else {
-                    0
-                };
-                if delta_time_ns > 0 {
-                    thread.cpu_usage_percent = (delta_cpu_time as f64 / delta_time_ns as f64) * 100.0;
-                    if thread.cpu_usage_percent > 100.0 {
-                        thread.cpu_usage_percent = 100.0;
-                    }
-                }
-                break;
+    // 名字缓存：仅在首次或每 COMM_REREAD_INTERVAL 轮重读 comm，避免每轮打开文件。
+    let name = if state.name.is_empty()
+        || round.wrapping_sub(state.name_read_round) >= COMM_REREAD_INTERVAL
+    {
+        let mut buf = [0u8; COMM_LEN + 2];
+        let n = read_comm(&comm_path, &mut buf);
+        if n > 0 {
+            let s = std::str::from_utf8(&buf[..n]).unwrap_or("");
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                state.name = trimmed.to_string();
             }
         }
-    }
-
-    let mut name = String::new();
-    if let Ok(mut f) = File::open(&comm_path) {
-        let mut buf = [0u8; MAX_THREAD_LEN - 1];
-        if let Ok(n) = f.read(&mut buf) {
-            if n > 0 {
-                name = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-            }
-        }
-    }
-    if name.is_empty() && !ctx.permissions_adjusted {
-        crate::procscan::setup_permissions(ctx);
-        if let Ok(mut f) = File::open(&comm_path) {
-            let mut buf = [0u8; MAX_THREAD_LEN - 1];
-            if let Ok(n) = f.read(&mut buf) {
-                if n > 0 {
-                    name = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-                }
-            }
-        }
-    }
-
-    if name.is_empty() {
-        let status_path = format!("/proc/{}/task/{}/status", pid, tid);
-        if let Ok(mut f) = File::open(&status_path) {
-            let mut buf = [0u8; 1024];
-            if let Ok(n) = f.read(&mut buf) {
-                let s = String::from_utf8_lossy(&buf[..n]);
-                if let Some(name_start) = s.find("Name:") {
-                    let rest = &s[name_start + 5..];
-                    if let Some(name_end) = rest.find('\n') {
-                        name = rest[..name_end].trim().to_string();
-                    }
-                }
-            }
-        }
-    }
-    if name.is_empty() {
-        name = format!("unknown_{}", tid);
-    }
-    thread.name = name;
+        state.name_read_round = round;
+        state.name.clone()
+    } else {
+        state.name.clone()
+    };
+    let name = if name.is_empty() {
+        format!("unknown_{}", tid)
+    } else {
+        name
+    };
 
     let mut set: cpu_set_t = unsafe { std::mem::zeroed() };
     unsafe { CPU_ZERO(&mut set) };
     let rc = unsafe { sched_getaffinity(tid, std::mem::size_of::<cpu_set_t>(), &mut set) };
     if rc < 0 {
+        // 线程已退出或不可访问，标记为未存活以便回收。
+        state.seen = false;
         return None;
     }
-    thread.affinity = set;
 
-    Some(thread)
+    Some(ThreadInfo {
+        name,
+        affinity: set,
+        cpu_usage_percent: fast,
+        cpu_usage_slow: slow,
+        main: tid == pid,
+    })
 }
 
-pub fn get_threads_by_pid(
-    ctx: &mut SystemContext,
-    pid: i32,
-    pkg_idx: usize,
-) -> Option<PackageThreads> {
+/// 扫描一个包进程的所有线程，返回快照。
+pub fn get_threads_by_pid(ctx: &mut SystemContext, pkg: &str, pid: i32) -> Option<PackageThreads> {
     let tids = scan_thread_ids(pid)?;
     let curr_time = mono_time();
-    let mut pkg_threads = PackageThreads {
-        threads: Vec::new(),
-        num_threads: 0,
-    };
-    // 确保外层 Vec 有 pkg_idx 对应的内层槽区
-    while ctx.last_thread_data.len() <= pkg_idx {
-        ctx.last_thread_data.push(Vec::new());
-    }
-    // 记录本轮命中的历史槽位索引，用于扫描结束后回收已退出线程的槽位
-    let mut used_slots: Vec<usize> = Vec::with_capacity(tids.len());
-    for tid in tids {
-        if let Some(thread) = read_thread_info(ctx, pid, tid, pkg_idx, curr_time) {
-            if ctx.affinity_initialized {
-                let slots = &mut ctx.last_thread_data[pkg_idx];
-                let mut found_idx: Option<usize> = None;
-                for (i, data) in slots.iter().enumerate() {
-                    if data.pid == pid && data.tid == tid {
-                        found_idx = Some(i);
-                        break;
-                    }
-                }
-                if let Some(i) = found_idx {
-                    slots[i].last_cpu_time = thread.cpu_time;
-                    slots[i].last_time = curr_time;
-                    used_slots.push(i);
-                } else {
-                    // 找空槽复用（线程退出后被回收留下的 0 槽），否则 push 新槽
-                    let mut empty_idx: Option<usize> = None;
-                    for (i, data) in slots.iter().enumerate() {
-                        if data.pid == 0 && data.tid == 0 {
-                            empty_idx = Some(i);
-                            break;
-                        }
-                    }
-                    match empty_idx {
-                        Some(i) => {
-                            slots[i] = ThreadData {
-                                pid,
-                                tid,
-                                last_cpu_time: thread.cpu_time,
-                                last_time: curr_time,
-                            };
-                            used_slots.push(i);
-                        }
-                        None => {
-                            slots.push(ThreadData {
-                                pid,
-                                tid,
-                                last_cpu_time: thread.cpu_time,
-                                last_time: curr_time,
-                            });
-                            used_slots.push(slots.len() - 1);
-                        }
-                    }
-                }
+
+    // 权限初始化：若首个线程 comm 不可读，则触发 chmod / SELinux 降级。
+    if !ctx.permissions_adjusted {
+        if let Some(&first) = tids.first() {
+            let comm_path = format!("/proc/{}/task/{}/comm", pid, first);
+            if !crate::procscan::can_read_path(&comm_path) {
+                crate::procscan::setup_permissions(ctx, &comm_path);
             }
+        }
+    }
+
+    // 本包线程状态表（按 tid 索引），修复按 pkg_idx 的错位。
+    let states = ctx.thread_states.entry(pkg.to_string()).or_default();
+    for s in states.values_mut() {
+        s.seen = false;
+    }
+
+    let mut pkg_threads = PackageThreads::default();
+    for tid in tids {
+        if let Some(thread) = read_thread_info(pid, tid, states, curr_time, ctx.round) {
             pkg_threads.threads.push(thread);
             pkg_threads.num_threads += 1;
         }
     }
 
-    // 回收本包槽区中本轮未命中的槽位（线程已退出），槽位复用避免 Vec 无限增长
-    if ctx.affinity_initialized {
-        let slots = &mut ctx.last_thread_data[pkg_idx];
-        for (i, data) in slots.iter_mut().enumerate() {
-            if !used_slots.contains(&i) {
-                data.pid = 0;
-                data.tid = 0;
-                data.last_cpu_time = 0;
-            }
+    // 回收本轮未命中的线程状态（已退出）。
+    states.retain(|_, s| s.seen);
+    // 防内存无限增长：超限时淘汰占用率最低的线程状态。
+    if states.len() > MAX_THREADS_PER_PKG {
+        let mut keys: Vec<(i32, f64)> = states.iter().map(|(k, v)| (*k, v.fast)).collect();
+        keys.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        let excess = states.len() - MAX_THREADS_PER_PKG;
+        for (k, _) in keys.into_iter().take(excess) {
+            states.remove(&k);
         }
     }
 

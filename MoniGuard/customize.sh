@@ -308,7 +308,7 @@ ABI="$(getprop ro.product.cpu.abi)"
 
 ui_print ""
 ui_print "**************************************************"
-ui_print "  MoniGuard v43 安装"
+ui_print "  MoniGuard $(grep_prop version "${MODPATH}/module.prop") 安装"
 ui_print "**************************************************"
 
 ui_print "  ─ 品牌: $(getprop ro.product.brand)"

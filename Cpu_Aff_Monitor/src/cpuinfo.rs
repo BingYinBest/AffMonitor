@@ -1,5 +1,5 @@
 use std::fs;
-use crate::types::{CpuCluster, CpuInfo};
+use crate::types::{CpuCluster, CpuInfo, SystemContext};
 use crate::utils::get_nprocs;
 
 fn read_i64(path: &str) -> i64 {
@@ -9,26 +9,132 @@ fn read_i64(path: &str) -> i64 {
         .unwrap_or(0)
 }
 
-pub fn init_cpu_info(
-    cpu_info: &mut Vec<CpuInfo>,
-    clusters: &mut Vec<CpuCluster>,
-    num_cpus: &mut usize,
-    num_clusters: &mut usize,
-    little_cluster_end: &mut i32,
-    big_cluster_start: &mut i32,
-    super_core: &mut i32,
-) {
+/// 给已排序（容量降序）的簇分配 AppOptR 语义名，兼容 1..=N 档拓扑。
+/// 返回 (has_m, has_p)。
+///
+/// - 1 簇：all-core
+/// - 2 簇：e-core + hp-core
+/// - 3 簇：e-core + p-core + hp-core
+/// - 4+ 簇：e-core + m-core + p-core×（中间档）+ hp-core
+fn assign_semantics(clusters: &mut [CpuCluster]) -> (bool, bool) {
+    let n = clusters.len();
+    if n == 1 {
+        clusters[0].semantic = "all-core".to_string();
+        clusters[0].type_name = "大核".to_string();
+        return (false, false);
+    }
+    // clusters[0] 是最高档。
+    clusters[0].semantic = "hp-core".to_string();
+    clusters[0].type_name = "超大核".to_string();
+    // 最低档固定为 e-core。
+    let last = n - 1;
+    clusters[last].semantic = "e-core".to_string();
+    clusters[last].type_name = "小核".to_string();
+    if n == 2 {
+        return (false, false);
+    }
+    if n == 3 {
+        clusters[1].semantic = "p-core".to_string();
+        clusters[1].type_name = "大核".to_string();
+        return (false, true);
+    }
+    // n >= 4：中间高段进 p-core，次低进 m-core，多出来的中间档折进 p-core。
+    for i in 1..(n - 2) {
+        clusters[i].semantic = "p-core".to_string();
+        clusters[i].type_name = "大核".to_string();
+    }
+    clusters[n - 2].semantic = "m-core".to_string();
+    clusters[n - 2].type_name = "中核".to_string();
+    (true, true)
+}
+
+/// 无 /sys 可读时按核心数启发式合成簇（兜底，仅保证不崩溃）。
+fn synthesize_fallback(ctx: &mut SystemContext) {
     let total = get_nprocs();
-    cpu_info.clear();
-    clusters.clear();
-    *num_cpus = 0;
-    *num_clusters = 0;
-    *little_cluster_end = -1;
-    *big_cluster_start = -1;
-    *super_core = -1;
+    ctx.num_cpus = total;
+    ctx.cpu_ids = (0..total as i32).collect();
+    let nclusters = if total >= 8 {
+        3
+    } else if total >= 5 {
+        2
+    } else {
+        1
+    };
+    ctx.num_clusters = nclusters;
+    let mut clusters: Vec<CpuCluster> = Vec::new();
+    match nclusters {
+        1 => {
+            clusters.push(CpuCluster {
+                start_cpu: 0,
+                end_cpu: (total - 1) as i32,
+                capacity: 1024,
+                max_freq: 3000000,
+                type_name: String::new(),
+                semantic: String::new(),
+            });
+        }
+        2 => {
+            let big_start = (total - 1) as i32;
+            clusters.push(CpuCluster {
+                start_cpu: big_start,
+                end_cpu: big_start,
+                capacity: 1024,
+                max_freq: 2800000,
+                type_name: String::new(),
+                semantic: String::new(),
+            });
+            clusters.push(CpuCluster {
+                start_cpu: 0,
+                end_cpu: (total - 2) as i32,
+                capacity: 512,
+                max_freq: 1800000,
+                type_name: String::new(),
+                semantic: String::new(),
+            });
+        }
+        _ => {
+            let super_id = (total - 1) as i32;
+            let big_id = (total - 2) as i32;
+            clusters.push(CpuCluster {
+                start_cpu: super_id,
+                end_cpu: super_id,
+                capacity: 1024,
+                max_freq: 3000000,
+                type_name: String::new(),
+                semantic: String::new(),
+            });
+            clusters.push(CpuCluster {
+                start_cpu: big_id,
+                end_cpu: big_id,
+                capacity: 768,
+                max_freq: 2500000,
+                type_name: String::new(),
+                semantic: String::new(),
+            });
+            clusters.push(CpuCluster {
+                start_cpu: 0,
+                end_cpu: (total - 3) as i32,
+                capacity: 512,
+                max_freq: 1800000,
+                type_name: String::new(),
+                semantic: String::new(),
+            });
+        }
+    }
+    assign_semantics(&mut clusters);
+    ctx.clusters = clusters;
+}
+
+pub fn init_cpu_info(ctx: &mut SystemContext) {
+    ctx.cpu_info.clear();
+    ctx.clusters.clear();
+    ctx.cpu_ids.clear();
+    ctx.num_cpus = 0;
+    ctx.num_clusters = 0;
 
     let mut freq_available = false;
     let mut capacity_available = false;
+    let mut cpu_info: Vec<CpuInfo> = Vec::new();
 
     if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") {
         for entry in entries.flatten() {
@@ -40,13 +146,10 @@ pub fn init_cpu_info(
             if !suffix.chars().all(|c| c.is_ascii_digit()) {
                 continue;
             }
-            if cpu_info.len() >= total {
-                break;
-            }
-            let cpu_id: i32 = suffix.parse().unwrap_or(-1);
-            if cpu_id < 0 {
-                continue;
-            }
+            let cpu_id: i32 = match suffix.parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
             let max_freq = read_i64(&format!(
                 "/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq",
                 cpu_id
@@ -70,55 +173,11 @@ pub fn init_cpu_info(
     }
 
     if cpu_info.is_empty() {
-        *num_cpus = total;
-        if *num_cpus <= 0 {
-            eprintln!("错误: 无法获取 CPU 核心数，程序退出");
-            std::process::exit(1);
-        }
-        *num_clusters = if *num_cpus >= 3 { 3 } else { *num_cpus };
-        for i in 0..*num_clusters {
-            let mut c = CpuCluster {
-                start_cpu: 0,
-                end_cpu: 0,
-                capacity: 0,
-                max_freq: 0,
-                type_name: String::new(),
-            };
-            if i == 0 && *num_clusters >= 1 {
-                c.start_cpu = (*num_cpus - 1) as i32;
-                c.end_cpu = (*num_cpus - 1) as i32;
-                c.capacity = 1024;
-                c.max_freq = 3000000;
-                c.type_name = "超大核".to_string();
-                *super_core = (*num_cpus - 1) as i32;
-            } else if i == 1 && *num_clusters >= 2 {
-                c.start_cpu = if *num_cpus >= 2 { (*num_cpus - 2) as i32 } else { 0 };
-                c.end_cpu = if *num_cpus >= 2 { (*num_cpus - 2) as i32 } else { 0 };
-                c.capacity = 768;
-                c.max_freq = 2500000;
-                c.type_name = "大核".to_string();
-                *big_cluster_start = c.start_cpu;
-            } else if i == 2 && *num_clusters >= 3 {
-                c.start_cpu = 0;
-                c.end_cpu = if *num_cpus >= 3 { (*num_cpus - 3) as i32 } else { 0 };
-                c.capacity = 512;
-                c.max_freq = 1800000;
-                c.type_name = "小核".to_string();
-                *little_cluster_end = c.end_cpu;
-            }
-            clusters.push(c);
-        }
-        println!("CPU 核心簇信息（默认配置）:");
-        for (i, c) in clusters.iter().enumerate() {
-            if c.start_cpu == c.end_cpu {
-                println!("簇 {}: CPU {}, 容量 {}, 频率 {}, 类型 {}", i, c.start_cpu, c.capacity, c.max_freq, c.type_name);
-            } else {
-                println!("簇 {}: CPU {}-{}, 容量 {}, 频率 {}, 类型 {}", i, c.start_cpu, c.end_cpu, c.capacity, c.max_freq, c.type_name);
-            }
-        }
+        synthesize_fallback(ctx);
         return;
     }
 
+    // 容量优先，其次频率；按能力降序，cpu_id 升序保证确定性。
     cpu_info.sort_by(|a, b| {
         b.capacity
             .cmp(&a.capacity)
@@ -127,75 +186,54 @@ pub fn init_cpu_info(
     });
 
     let use_freq = freq_available && !capacity_available;
+    let mut clusters: Vec<CpuCluster> = Vec::new();
     let mut last_value: i64 = -1;
     let mut cluster_start = 0usize;
-    let mut cluster_count = 0usize;
     for i in 0..cpu_info.len() {
-        let current_value = if use_freq {
+        let cur = if use_freq {
             cpu_info[i].max_freq
         } else {
             cpu_info[i].capacity
         };
-        if current_value != last_value && last_value != -1 {
+        if cur != last_value && last_value != -1 {
+            // 簇内 cpu_id 可能因容量降序而乱序，取最小/最大作为范围（升序展示）。
+            let group = &cpu_info[cluster_start..i];
+            let lo = group.iter().map(|c| c.cpu_id).min().unwrap_or(0);
+            let hi = group.iter().map(|c| c.cpu_id).max().unwrap_or(0);
             clusters.push(CpuCluster {
-                start_cpu: cpu_info[cluster_start].cpu_id,
-                end_cpu: cpu_info[i - 1].cpu_id,
+                start_cpu: lo,
+                end_cpu: hi,
                 capacity: last_value,
                 max_freq: cpu_info[cluster_start].max_freq,
                 type_name: String::new(),
+                semantic: String::new(),
             });
-            cluster_count += 1;
             cluster_start = i;
         }
-        last_value = current_value;
+        last_value = cur;
     }
     if cluster_start < cpu_info.len() {
+        let group = &cpu_info[cluster_start..];
+        let lo = group.iter().map(|c| c.cpu_id).min().unwrap_or(0);
+        let hi = group.iter().map(|c| c.cpu_id).max().unwrap_or(0);
         clusters.push(CpuCluster {
-            start_cpu: cpu_info[cluster_start].cpu_id,
-            end_cpu: cpu_info[cpu_info.len() - 1].cpu_id,
+            start_cpu: lo,
+            end_cpu: hi,
             capacity: last_value,
             max_freq: cpu_info[cluster_start].max_freq,
             type_name: String::new(),
+            semantic: String::new(),
         });
-        cluster_count += 1;
-    }
-    *num_clusters = cluster_count;
-
-    for i in 0..*num_clusters {
-        if *num_clusters == 1 {
-            clusters[i].type_name = "大核".to_string();
-            *big_cluster_start = clusters[i].start_cpu;
-        } else if *num_clusters == 2 {
-            clusters[i].type_name = if i == 0 { "大核".to_string() } else { "小核".to_string() };
-            if i == 0 {
-                *big_cluster_start = clusters[i].start_cpu;
-            } else {
-                *little_cluster_end = clusters[i].end_cpu;
-            }
-        } else {
-            if i == 0 {
-                clusters[i].type_name = "超大核".to_string();
-                *super_core = clusters[i].start_cpu;
-            } else if i == *num_clusters - 1 {
-                clusters[i].type_name = "小核".to_string();
-                *little_cluster_end = clusters[i].end_cpu;
-            } else {
-                clusters[i].type_name = "大核".to_string();
-                if *big_cluster_start == -1 {
-                    *big_cluster_start = clusters[i].start_cpu;
-                }
-            }
-        }
     }
 
-    *num_cpus = cpu_info.len();
-
-    println!("CPU 核心簇信息:");
-    for (i, c) in clusters.iter().enumerate() {
-        if c.start_cpu == c.end_cpu {
-            println!("簇 {}: CPU {}, 容量 {}, 频率 {}, 类型 {}", i, c.start_cpu, c.capacity, c.max_freq, c.type_name);
-        } else {
-            println!("簇 {}: CPU {}-{}, 容量 {}, 频率 {}, 类型 {}", i, c.start_cpu, c.end_cpu, c.capacity, c.max_freq, c.type_name);
-        }
-    }
+    let (has_m, has_p) = assign_semantics(&mut clusters);
+    ctx.has_m = has_m;
+    ctx.has_p = has_p;
+    ctx.cpu_info = cpu_info.clone();
+    ctx.clusters = clusters;
+    ctx.num_cpus = cpu_info.len();
+    ctx.num_clusters = ctx.clusters.len();
+    ctx.cpu_ids = cpu_info.iter().map(|c| c.cpu_id).collect();
+    // 亲和显示需按升序遍历（affinity_to_string 依赖升序建区间）。
+    ctx.cpu_ids.sort();
 }

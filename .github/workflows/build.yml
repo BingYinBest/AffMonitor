@@ -1,0 +1,91 @@
+name: Build MoniGuard
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK r26d
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "ndk;26.3.11579264"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            aarch64-linux-android
+            armv7-linux-androideabi
+            i686-linux-android
+            x86_64-linux-android
+
+      - name: Build all ABIs
+        env:
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang
+          CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi30-clang
+          CARGO_TARGET_I686_LINUX_ANDROID_LINKER: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android30-clang
+          CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android30-clang
+        run: |
+          cd Cpu_Aff_Monitor
+          for t in aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android; do
+            echo "==> Building $t"
+            cargo build --release --target "$t"
+          done
+
+      - name: Stage binaries and package module
+        run: |
+          set -e
+          mkdir -p MoniGuard/bin/arm64-v8a MoniGuard/bin/armeabi-v7a MoniGuard/bin/x86 MoniGuard/bin/x86_64
+          cp Cpu_Aff_Monitor/target/aarch64-linux-android/release/Cpu_Aff_Monitor MoniGuard/bin/arm64-v8a/
+          cp Cpu_Aff_Monitor/target/armv7-linux-androideabi/release/Cpu_Aff_Monitor MoniGuard/bin/armeabi-v7a/
+          cp Cpu_Aff_Monitor/target/i686-linux-android/release/Cpu_Aff_Monitor MoniGuard/bin/x86/
+          cp Cpu_Aff_Monitor/target/x86_64-linux-android/release/Cpu_Aff_Monitor MoniGuard/bin/x86_64/
+          chmod +x MoniGuard/bin/*/Cpu_Aff_Monitor
+          VER=$(grep -oP 'version=\K[0-9]+' MoniGuard/module.prop | head -1)
+          [ -n "$VER" ] || { echo "cannot read version from module.prop"; exit 1; }
+          mkdir -p release
+          (cd MoniGuard && zip -r "../release/MoniGuard-v${VER}.zip" . -x '*/.*')
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          echo "Packaged MoniGuard-v${VER}.zip"
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: MoniGuard-module
+          path: release/MoniGuard-v*.zip
+
+      - name: Upload ABI binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: MoniGuard-binaries
+          path: |
+            MoniGuard/bin/arm64-v8a/Cpu_Aff_Monitor
+            MoniGuard/bin/armeabi-v7a/Cpu_Aff_Monitor
+            MoniGuard/bin/x86/Cpu_Aff_Monitor
+            MoniGuard/bin/x86_64/Cpu_Aff_Monitor
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/MoniGuard-v*.zip
+            MoniGuard/bin/arm64-v8a/Cpu_Aff_Monitor
+            MoniGuard/bin/armeabi-v7a/Cpu_Aff_Monitor
+            MoniGuard/bin/x86/Cpu_Aff_Monitor
+            MoniGuard/bin/x86_64/Cpu_Aff_Monitor

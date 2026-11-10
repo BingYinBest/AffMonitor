@@ -1,1 +1,18 @@
+# 构建产物
 target/
+release/
+Modules_Update/
+MoniGuard/bin/
+
+# 本机工具链配置（含机器特定 NDK 路径，勿入库）
+Cpu_Aff_Monitor/.cargo/
+
+# 仓库内不发布的本地文档
+AGENTS.md
+审查报告.md
+
+# 压缩包为 CI 产物
+*.zip
+
+# 系统
+.DS_Store
