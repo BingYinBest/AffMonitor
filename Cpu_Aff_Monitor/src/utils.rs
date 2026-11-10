@@ -22,7 +22,7 @@ pub fn get_nprocs() -> usize {
 }
 
 /// 把 cpu_set_t 转成 "0-3,6" 形式。按实际存在的 cpu_ids 遍历，
-/// 兼容非连续 / 离线 CPU（BUG-7 修复）。
+/// 兼容非连续 / 离线 CPU。
 pub fn affinity_to_string(set: &cpu_set_t, cpu_ids: &[i32]) -> String {
     let mut ranges: Vec<String> = Vec::new();
     let mut start: i32 = -1;
@@ -62,7 +62,7 @@ pub fn affinity_to_string(set: &cpu_set_t, cpu_ids: &[i32]) -> String {
 /// 线程名转为可安全用于 AppOptR 线程模式的字面量。
 /// AppOptR 线程模式是 fnmatch 模式（FNM_NOESCAPE，无转义）；`{}`/`=` 会破坏其行解析，
 /// `*?[]` 会被当作通配导致过度匹配。含这些字符的名字无法精确表达，返回 None 跳过，
-/// 避免生成错误规则（BUG-2 关联）。
+/// 避免生成错误规则。
 pub fn appoptr_pattern(name: &str) -> Option<&str> {
     if name.is_empty() {
         return None;
@@ -74,46 +74,6 @@ pub fn appoptr_pattern(name: &str) -> Option<&str> {
         return None;
     }
     Some(name)
-}
-
-/// 生成线程规则的目标亲和（可含逗号组合）。2 档仅 e/hp，3 档 e/p/hp，4+ 档 e/m/p/hp。
-pub fn rule_semantic(rank: u8, has_m: bool, has_p: bool) -> &'static str {
-    match rank {
-        3 => "hp-core",
-        2 => {
-            if has_p {
-                "p-core,hp-core"
-            } else {
-                "hp-core"
-            }
-        }
-        1 => {
-            if has_m {
-                "m-core"
-            } else if has_p {
-                "p-core"
-            } else {
-                "e-core"
-            }
-        }
-        _ => "e-core",
-    }
-}
-
-/// 计算包级默认亲和（覆盖未命中线程规则的其余线程）。
-/// 系统进程偏大核，普通应用偏小核+中核；2 档时退化为 e,hp（即全部），1 档 all-core。
-pub fn default_tier(is_system: bool, has_p: bool) -> &'static str {
-    if is_system {
-        if has_p {
-            "p-core,hp-core"
-        } else {
-            "hp-core"
-        }
-    } else if has_p {
-        "e-core,p-core"
-    } else {
-        "e-core,hp-core"
-    }
 }
 
 pub fn compare_threads(a: &ThreadInfo, b: &ThreadInfo) -> Ordering {

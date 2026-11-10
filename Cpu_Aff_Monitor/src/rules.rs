@@ -1,8 +1,76 @@
 use crate::constants::*;
-use crate::types::{PackageThreads, RuleInfo, SystemContext, ThreadInfo};
-use crate::utils::{appoptr_pattern, default_tier, rule_semantic};
+use crate::types::{CpuCluster, PackageThreads, RuleInfo, SystemContext, ThreadInfo};
+use crate::utils::appoptr_pattern;
 use std::collections::HashMap;
 use std::fmt::Write;
+
+/// 给定簇列表和目标 rank（0=little..3=super），返回该 rank 对应的显式 CPU 范围字符串。
+/// 簇必须按 capacity 降序排列（由 init_cpu_info 保证）。
+fn rank_to_cpu_range(rank: u8, clusters: &[CpuCluster]) -> String {
+    let n = clusters.len();
+    match n {
+        1 => {
+            let c = &clusters[0];
+            if c.start_cpu == c.end_cpu {
+                c.start_cpu.to_string()
+            } else {
+                format!("{}-{}", c.start_cpu, c.end_cpu)
+            }
+        }
+        2 => {
+            if rank == 0 {
+                let c = &clusters[1];
+                if c.start_cpu == c.end_cpu {
+                    c.start_cpu.to_string()
+                } else {
+                    format!("{}-{}", c.start_cpu, c.end_cpu)
+                }
+            } else {
+                let c = &clusters[0];
+                if c.start_cpu == c.end_cpu {
+                    c.start_cpu.to_string()
+                } else {
+                    format!("{}-{}", c.start_cpu, c.end_cpu)
+                }
+            }
+        }
+        3 => match rank {
+            0 => {
+                let c = &clusters[2];
+                if c.start_cpu == c.end_cpu {
+                    c.start_cpu.to_string()
+                } else {
+                    format!("{}-{}", c.start_cpu, c.end_cpu)
+                }
+            }
+            1 => {
+                let c = &clusters[1];
+                if c.start_cpu == c.end_cpu {
+                    c.start_cpu.to_string()
+                } else {
+                    format!("{}-{}", c.start_cpu, c.end_cpu)
+                }
+            }
+            _ => {
+                let c = &clusters[0];
+                if c.start_cpu == c.end_cpu {
+                    c.start_cpu.to_string()
+                } else {
+                    format!("{}-{}", c.start_cpu, c.end_cpu)
+                }
+            }
+        },
+        _ => {
+            let idx = if rank as usize >= n { n - 1 } else { rank as usize };
+            let c = &clusters[idx];
+            if c.start_cpu == c.end_cpu {
+                c.start_cpu.to_string()
+            } else {
+                format!("{}-{}", c.start_cpu, c.end_cpu)
+            }
+        }
+    }
+}
 
 /// 线程类别检测：返回 (AppOptR 线程模式, 是否后台线程)。
 /// 后台维护线程（JIT/GC/Finalizer 等）即使忙也压小核；关键渲染/UI 线程给大核。
@@ -120,7 +188,6 @@ fn update_historical(ctx: &mut SystemContext, pkg: &str, pattern: &str, semantic
         }
     }
     if ctx.historical_rules.len() >= ctx.historical_rules_capacity {
-        // 淘汰最旧一条，避免 Vec 无限增长。
         ctx.historical_rules.remove(0);
     }
     ctx.historical_rules.push(RuleInfo {
@@ -131,7 +198,92 @@ fn update_historical(ctx: &mut SystemContext, pkg: &str, pattern: &str, semantic
     });
 }
 
-/// 生成 AppOptR 兼容规则，写入 out。规则按 (模式, 最高档) 分组，输出稳定、紧凑。
+/// 包级默认亲和：系统进程偏大核，普通应用偏小核+大核；始终包含全部可用核心。
+fn default_tier(is_system: bool, has_m: bool, has_p: bool, clusters: &[CpuCluster]) -> String {
+    let all_cores: String = if clusters.is_empty() {
+        "?".to_string()
+    } else if clusters.len() == 1 {
+        let c = &clusters[0];
+        if c.start_cpu == c.end_cpu {
+            c.start_cpu.to_string()
+        } else {
+            format!("{}-{}", c.start_cpu, c.end_cpu)
+        }
+    } else {
+        // 全部簇范围用逗号连接
+        clusters
+            .iter()
+            .map(|c| {
+                if c.start_cpu == c.end_cpu {
+                    c.start_cpu.to_string()
+                } else {
+                    format!("{}-{}", c.start_cpu, c.end_cpu)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    if is_system {
+        if has_p && clusters.len() >= 3 {
+            // 系统：p-core + hp-core（中间档+最高档）
+            let start_idx = if has_m { 1 } else { 2 };
+            clusters[start_idx..]
+                .iter()
+                .map(|c| {
+                    if c.start_cpu == c.end_cpu {
+                        c.start_cpu.to_string()
+                    } else {
+                        format!("{}-{}", c.start_cpu, c.end_cpu)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        } else if clusters.len() >= 2 {
+            // 只有2档：取最高档
+            let c = &clusters[0];
+            if c.start_cpu == c.end_cpu {
+                c.start_cpu.to_string()
+            } else {
+                format!("{}-{}", c.start_cpu, c.end_cpu)
+            }
+        } else {
+            all_cores
+        }
+    } else {
+        if has_p && clusters.len() >= 3 {
+            // 应用：e-core + p-core（最低档+中间档）
+            let end_idx = if has_m { 2 } else { clusters.len() - 1 };
+            clusters[..end_idx]
+                .iter()
+                .map(|c| {
+                    if c.start_cpu == c.end_cpu {
+                        c.start_cpu.to_string()
+                    } else {
+                        format!("{}-{}", c.start_cpu, c.end_cpu)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        } else if clusters.len() >= 2 {
+            // 2档：e-core + hp-core
+            if clusters.len() == 2 {
+                format!(
+                    "{},{}",
+                    rank_to_cpu_range(0, clusters),
+                    rank_to_cpu_range(1, clusters)
+                )
+            } else {
+                all_cores
+            }
+        } else {
+            all_cores
+        }
+    }
+}
+
+/// 生成 AppOptR 兼容规则，写入 out。
+/// 规则按 (模式, 最高档) 分组，输出稳定、紧凑；
+/// 当簇数 ≥ 2 时使用显式 CPU 范围（如 "4-5"），否则用语义名。
 pub fn generate_rules(
     ctx: &mut SystemContext,
     pkg: &str,
@@ -140,6 +292,7 @@ pub fn generate_rules(
     _is_foreground: bool,
     is_system: bool,
 ) {
+    let clusters = &ctx.clusters;
     let threads = &pkg_threads.threads;
 
     // 1. 收集 (模式 -> (最高档, 最大占用))，同一模式合并取最高档。
@@ -156,7 +309,7 @@ pub fn generate_rules(
         }
     }
 
-    // 2. 按占用率降序（高占用在前），超限裁剪，保持确定性。
+    // 2. 按占用率降序，超限裁剪。
     let mut rules: Vec<(String, u8, f64)> = groups
         .into_iter()
         .map(|(p, (r, u))| (p, r, u))
@@ -171,29 +324,35 @@ pub fn generate_rules(
     }
 
     // 3. 包级默认亲和（覆盖未命中线程规则的其余线程）。
-    let default = default_tier(is_system, ctx.has_p);
+    let default = default_tier(is_system, ctx.has_m, ctx.has_p, clusters);
 
-    // 4. 输出 AppOptR 兼容块。
+    // 4. 输出 AppOptR 兼容块（显式 CPU 范围格式）。
     if rules.is_empty() {
         let _ = writeln!(out, "{}={}", pkg, default);
     } else {
         let _ = writeln!(out, "{}={} {{", pkg, default);
         for (pattern, rank, _u) in &rules {
-            let sem = rule_semantic(*rank, ctx.has_m, ctx.has_p);
+            let sem = rank_to_cpu_range(*rank, clusters);
             let _ = writeln!(out, "\t{}={}", pattern, sem);
         }
         let _ = writeln!(out, "}}");
     }
 
-    // 5. 更新历史规则（按 (pkg, pattern) 去重，键不含 CPU 范围，修复 BUG-3）。
+    // 5. 预计算所有语义字符串（避免同时借用 ctx 可变和不可变）。
     let mut active: Vec<&str> = Vec::with_capacity(rules.len());
+    let mut hist_items: Vec<(&str, String, f64)> = Vec::with_capacity(rules.len());
     for (pattern, rank, usage) in &rules {
-        let sem = rule_semantic(*rank, ctx.has_m, ctx.has_p);
-        update_historical(ctx, pkg, pattern, sem, *usage);
+        let sem = rank_to_cpu_range(*rank, clusters);
+        hist_items.push((pattern.as_str(), sem, *usage));
         active.push(pattern.as_str());
     }
 
-    // 6. 历史注释：曾经忙但本轮不再活跃的线程，作为建议保留（不参与解析）。
+    // 6. 更新历史规则（按 (pkg, pattern) 去重，键不含 CPU 范围）。
+    for (pattern, sem, usage) in hist_items {
+        update_historical(ctx, pkg, pattern, &sem, usage);
+    }
+
+    // 7. 历史注释：曾经忙但本轮不再活跃的线程，作为建议保留（不参与解析）。
     for rule in &ctx.historical_rules {
         if rule.pkg != pkg {
             continue;
