@@ -16,13 +16,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up NDK r26d
+      - name: Set up NDK r30 (latest)
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r26d
+          ndk-version: r30
           local-cache: true
 
-      - name: Set up Rust
+      - name: Set up Rust (latest stable)
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: >-
@@ -33,11 +33,12 @@ jobs:
 
       - name: Build all ABIs
         env:
-          ANDROID_NDK_HOME: ${{ github.workspace }}/android-ndk-r26d
-          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ github.workspace }}/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang
-          CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER: ${{ github.workspace }}/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi30-clang
-          CARGO_TARGET_I686_LINUX_ANDROID_LINKER: ${{ github.workspace }}/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android30-clang
-          CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER: ${{ github.workspace }}/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android30-clang
+          ANDROID_NDK_HOME: ${{ github.workspace }}/android-ndk-r30
+          # NDK r30 default API level is 30; toolchain prefix is llvm prebuilt
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ github.workspace }}/android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang
+          CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER: ${{ github.workspace }}/android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi30-clang
+          CARGO_TARGET_I686_LINUX_ANDROID_LINKER: ${{ github.workspace }}/android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android30-clang
+          CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER: ${{ github.workspace }}/android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android30-clang
         run: |
           cd Cpu_Aff_Monitor
           for t in aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android; do
